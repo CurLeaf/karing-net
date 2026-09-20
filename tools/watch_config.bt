@@ -1,0 +1,114 @@
+// Who writes Karing's service_core.json, and when.
+//
+// The reconcile fast path depends on one measured fact: the app rewrites the file
+// in place (openat with O_TRUNC, flags 0x80242) and asks the core to reload about
+// a tenth of a second later.  This script is the witness for that -- it prints
+// every openat for the file, every rename onto it, and (with a pid argument) every
+// file the app itself writes.
+//
+// Usage:
+//     sudo bpftrace ~/Projects/karing-net/tools/watch_config.bt \
+//         $(pgrep -f '/opt/karing/karing$') | tee -a ~/.local/share/karing-net/config-writes.log
+//
+// The pid argument is the Karing GUI process.  It is optional: without it the
+// last probe (everything the app writes) stays silent and bpftrace says so.
+//
+// Lines carry elapsed time in seconds.milliseconds since the tracer started; the
+// BEGIN line carries the wall clock, so the two together give absolute times.
+
+BEGIN
+{
+    printf("[start] %s (elapsed column is relative to this line)\n", strftime("%F %T", nsecs));
+}
+
+tracepoint:syscalls:sys_enter_openat
+/str(args->filename) == "service_core.json"
+  && (args->flags & 0x643) != 0/
+{
+    printf("[%d.%03d] [WRITE-OPEN] pid=%-7d comm=%-16s dirfd=%d flags=0x%x file=REL\n",
+           elapsed / 1000000000, (elapsed % 1000000000) / 1000000,
+           pid, comm, args->dfd, args->flags);
+}
+
+tracepoint:syscalls:sys_enter_openat
+/str(args->filename) == "/home/yxw/.local/share/com.nebula.karing/service_core.json"
+  && (args->flags & 0x643) != 0/
+{
+    printf("[%d.%03d] [WRITE-OPEN] pid=%-7d comm=%-16s dirfd=%d flags=0x%x file=ABS\n",
+           elapsed / 1000000000, (elapsed % 1000000000) / 1000000,
+           pid, comm, args->dfd, args->flags);
+}
+
+// Every openat of the file, whatever the flags: this is the probe that answers
+// "who *reads* it", which is how the core's own O_RDONLY re-read was identified.
+tracepoint:syscalls:sys_enter_openat
+/str(args->filename) == "service_core.json"
+  || str(args->filename) == "/home/yxw/.local/share/com.nebula.karing/service_core.json"/
+{
+    printf("[%d.%03d] [OPEN] pid=%-7d comm=%-16s dirfd=%d flags=0x%x\n",
+           elapsed / 1000000000, (elapsed % 1000000000) / 1000000,
+           pid, comm, args->dfd, args->flags);
+}
+
+// Older binaries use open(2) rather than openat(2); keep both covered.
+tracepoint:syscalls:sys_enter_open
+/str(args->filename) == "service_core.json"
+  || str(args->filename) == "/home/yxw/.local/share/com.nebula.karing/service_core.json"/
+{
+    printf("[%d.%03d] [OPEN-OLD] pid=%-7d comm=%-16s flags=0x%x\n",
+           elapsed / 1000000000, (elapsed % 1000000000) / 1000000,
+           pid, comm, args->flags);
+}
+
+tracepoint:syscalls:sys_enter_unlinkat
+/str(args->pathname) == "service_core.json"
+  || str(args->pathname) == "/home/yxw/.local/share/com.nebula.karing/service_core.json"/
+{
+    printf("[%d.%03d] [UNLINK] pid=%-7d comm=%-16s\n",
+           elapsed / 1000000000, (elapsed % 1000000000) / 1000000,
+           pid, comm);
+}
+
+tracepoint:syscalls:sys_enter_openat
+/str(args->filename) == "service_core.json.tmp"/
+{
+    printf("[%d.%03d] [TMP-OPEN] pid=%-7d comm=%-16s dirfd=%d flags=0x%x\n",
+           elapsed / 1000000000, (elapsed % 1000000000) / 1000000,
+           pid, comm, args->dfd, args->flags);
+}
+
+// Our own writer renames a .tmp over the file; the app truncates in place.  Both
+// end up here, which is how the two are told apart in one log.
+tracepoint:syscalls:sys_enter_renameat2
+/str(args->newname) == "service_core.json" || str(args->newname) == "/home/yxw/.local/share/com.nebula.karing/service_core.json"/
+{
+    printf("[%d.%03d] [RENAME2] pid=%-7d comm=%-16s from=%s\n",
+           elapsed / 1000000000, (elapsed % 1000000000) / 1000000,
+           pid, comm, str(args->oldname));
+}
+
+tracepoint:syscalls:sys_enter_rename
+/str(args->newname) == "service_core.json" || str(args->newname) == "/home/yxw/.local/share/com.nebula.karing/service_core.json"/
+{
+    printf("[%d.%03d] [RENAME] pid=%-7d comm=%-16s from=%s\n",
+           elapsed / 1000000000, (elapsed % 1000000000) / 1000000,
+           pid, comm, str(args->oldname));
+}
+
+// Everything the app writes, not just this file: the answer to "what else does a
+// reconnect rewrite".  Silent unless the app pid is passed as $1.
+tracepoint:syscalls:sys_enter_openat
+/pid == $1 && (args->flags & 0x643) != 0/
+{
+    printf("[%d.%03d] [APP-WRITE] pid=%d comm=%s flags=0x%x dirfd=%d file=%s\n",
+           elapsed / 1000000000, (elapsed % 1000000000) / 1000000,
+           pid, comm, args->flags, args->dfd, str(args->filename));
+}
+
+tracepoint:syscalls:sys_enter_renameat2
+/pid == $1/
+{
+    printf("[%d.%03d] [APP-RENAME2] %s -> %s\n",
+           elapsed / 1000000000, (elapsed % 1000000000) / 1000000,
+           str(args->oldname), str(args->newname));
+}

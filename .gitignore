@@ -1,0 +1,10 @@
+# Python 字节码缓存
+__pycache__/
+*.py[cod]
+
+# sync_rules / karing-gc / karing-reconcile 的跨进程写锁,运行时生成
+.sync_rules.lock
+
+# 本机的强制直连域名清单:里面是公司内部域名与服务器 IP,不进版本控制。
+# 需要这份配置时从 direct.example.json 复制一份改名即可,格式一致。
+direct.json

@@ -1,0 +1,14 @@
+{
+  "_comment": "TEMPLATE ONLY. Copy to direct.json and put your own domains in. The real direct.json is gitignored: it lists internal company domains, which do not belong in a shared checkout.",
+  "group_name": "🏠 强制直连",
+  "domain_suffix": [
+    "internal.example.com",
+    "intranet.example.com",
+    "legacy-portal.example.com"
+  ],
+  "ip_cidr": [
+    "203.0.113.10/32",
+    "203.0.113.11/32",
+    "198.51.100.20/32"
+  ]
+}
