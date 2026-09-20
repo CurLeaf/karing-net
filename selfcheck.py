@@ -371,8 +371,8 @@ def main() -> int:
     ):
         check_http("代理端口", url, "proxy", spec, lan, label)
     if forced:
-        check_http("代理端口", f"https://{forced[0]}", "200,301,302",
-                   f"{forced[0]} 强制直连域名", lan)
+        check_http("代理端口", f"https://{forced[0]}", "proxy", "200,301,302", lan,
+                   f"{forced[0]} (强制直连域名，经代理端口)")
 
     print("\n--- 5. Karing 内核状态 ---")
     core_state()
