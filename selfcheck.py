@@ -34,6 +34,7 @@ SERVICE_JSON = KARING_DIR / "service.json"
 NET_DIR = Path.home() / ".local/share/karing-net"
 WATCH_LOG = NET_DIR / "tunnel-watch.log"
 RECONCILE_STATE = NET_DIR / "reconcile-state.json"
+GC_STATE = NET_DIR / "gc-state.json"
 FAKEIP_NETS = (ipaddress.ip_network("198.18.0.0/15"), ipaddress.ip_network("198.20.0.0/15"))
 DIRECT_JSON = Path(__file__).resolve().parent / "direct.json"
 
@@ -237,10 +238,20 @@ def local_state() -> None:
     record("本机", "proxy ports", ok, f"missing={missing} listening={sorted(want & set(ports))}")
     print(f"  {'OK ' if ok else 'FAIL'} proxy ports {sorted(want & set(ports))} missing={missing or 'none'}")
 
-    ifindex = run(["cat", f"/sys/class/net/{TUN}/ifindex"], timeout=4.0).strip()
-    ok = bool(re.fullmatch(r"\d+", ifindex))
-    record("本机", f"{TUN}", ok, f"ifindex={ifindex or 'absent'}")
-    print(f"  {'OK ' if ok else 'FAIL'} {TUN} ifindex={ifindex or 'absent'}")
+    # interface_name is empty, so the kernel assigns the next free tunN.
+    # Match Karing by the tun inbound address, not the name tun0.
+    ip_out = run(["ip", "-o", "-4", "addr", "show"], timeout=4.0)
+    match = re.search(r"\d+:\s+(tun\d+)\s+inet\s+10\.20\.0\.1/", ip_out)
+    if match:
+        name = match.group(1)
+        ifindex = run(["cat", f"/sys/class/net/{name}/ifindex"], timeout=4.0).strip()
+        record("本机", "karing tun", True, f"{name} ifindex={ifindex}")
+        print(f"  OK  karing tun {name} ifindex={ifindex}")
+    else:
+        ifindex = run(["cat", f"/sys/class/net/{TUN}/ifindex"], timeout=4.0).strip()
+        ok = bool(re.fullmatch(r"\d+", ifindex))
+        record("本机", f"{TUN}", ok, f"ifindex={ifindex or 'absent'}")
+        print(f"  {'OK ' if ok else 'FAIL'} {TUN} ifindex={ifindex or 'absent'}")
 
     # `-x` matches the process name exactly.  `pgrep -af karingService` matched any
     # command line that merely mentioned the string -- a shell, a grep, an editor
@@ -307,6 +318,33 @@ def reconcile_state() -> None:
         warn("回收", "failures", f"累计 {st['failures']} 次（补写无效、内核拒绝或循环异常）")
     if race.get("lost"):
         warn("回收", "race.lost", f"{race['lost']} 次没抢在 App 的 reload 前面，每次多一次 reload 和 tun0 重建")
+
+
+def gc_state() -> None:
+    """karing-gc counters: closed == misrouted + recycled, recycled == dead + stale."""
+    if not GC_STATE.exists():
+        warn("连接回收", "gc state", f"{GC_STATE} 不存在")
+        print(f"  WARN 状态文件不存在 {GC_STATE}")
+        return
+    try:
+        st = json.loads(GC_STATE.read_text())
+    except Exception as exc:
+        record("连接回收", "gc state", False, repr(exc))
+        print(f"  FAIL 状态文件读不出来: {exc!r}")
+        return
+    closed = int(st.get("closed") or 0)
+    mis = int(st.get("misrouted") or 0)
+    rec = int(st.get("recycled") or 0)
+    dead = int(st.get("recycled_dead") or 0)
+    stale = int(st.get("recycled_stale") or 0)
+    now = st.get("now") or {}
+    ok = closed == mis + rec and rec == dead + stale
+    detail = (f"closed={closed} misrouted={mis} recycled={rec} "
+              f"dead={dead} stale={stale} now={now}")
+    record("连接回收", "counters", ok, detail)
+    print(f"  {'OK ' if ok else 'FAIL'} {detail}")
+    if st.get("closed_legacy"):
+        print(f"       closed_legacy={st['closed_legacy']} (pre-policy, not in closed)")
 
 
 def main() -> int:
@@ -385,6 +423,9 @@ def main() -> int:
 
     print("\n--- 8. 回收器最近一次运行 ---")
     reconcile_state()
+
+    print("\n--- 9. 连接回收计数 ---")
+    gc_state()
 
     total = len(RESULTS)
     passed = sum(1 for _, _, ok, _ in RESULTS if ok)

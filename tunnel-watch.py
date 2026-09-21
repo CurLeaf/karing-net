@@ -13,7 +13,8 @@ This watcher builds one timeline so the next drop can be attributed:
 
 * Karing GUI and karingService process start / exit (with pid and wall time)
 * listeners on the proxy ports (3057 control, 3065/3066/3067 mixed)
-* tun0 create / destroy (tracked by ifindex, so a rebuild is visible)
+* tun create / destroy (tracked by ifindex and by Karing's tun address, so a
+  rebuild onto tun1/tun2 is visible and a foreign tun is not mistaken for ours)
 * selected node per group, plus that node's delay
 * live connection count
 * reachability through the proxy and direct, sampled phase by phase
@@ -77,11 +78,13 @@ plus a larger indirect cost on the core itself, which was being asked to stream
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -108,6 +111,13 @@ PROXY_ENDPOINT = ("127.0.0.1", PROXY_PORT)
 WATCHED_PORTS = (3057, 3065, 3066, 3067)
 NOTIFY_BIN = Path("/usr/bin/notify-send")
 TUN = "tun0"
+SYS_NET = Path("/sys/class/net")
+# Karing's tun inbound leaves interface_name empty, so the kernel hands out the
+# next free tunN.  The stable identity is the address in service_core.json
+# (10.20.0.1/30 here), not the name tun0.
+DEFAULT_TUN_ADDRS = frozenset({"10.20.0.1"})
+_tun_addrs_cache: tuple[float, frozenset[str]] | None = None
+SIOCGIFADDR = 0x8915
 
 POLL_SECONDS = 2.0            # tun0 + listening ports: two small file reads
 PROC_SCAN_SECONDS = 10.0      # /proc sweep, to catch a core restart
@@ -159,6 +169,8 @@ KARING_EXE_NAMES = {"karingService": "core", "karing": "gui"}
 KARING_INSTALL_DIR = Path("/opt/karing")
 
 NOTIFY_COOLDOWN = 60.0        # per category, and failure/recovery do not share
+NOTIFY_EXPIRE_MS = 8000       # GNOME ignores this for urgency=critical, so we don't use that
+
 
 GROUP_TYPES = {"urltest", "url-test", "selector"}
 
@@ -814,19 +826,127 @@ def listening_ports() -> set[int]:
     return live
 
 
-def tun_state() -> tuple[bool, int, str]:
-    base = Path(f"/sys/class/net/{TUN}")
-    if not base.exists():
-        return False, 0, ""
+@dataclass(frozen=True)
+class TunStatus:
+    """One poll of Karing's tunnel interface, whichever tunN it occupies."""
+
+    present: bool
+    ifindex: int = 0
+    operstate: str = ""
+    name: str = ""
+
+    def render(self) -> str:
+        if not self.present:
+            return "none"
+        return f"{self.name}/{self.ifindex}/{self.operstate}"
+
+
+ABSENT_TUN = TunStatus(present=False)
+
+
+def iface_ipv4(name: str) -> str:
+    """IPv4 address of a local interface, or '' if it has none yet."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        ifindex = int((base / "ifindex").read_text().strip())
+        packed = struct.pack("256s", name.encode("ascii", "replace")[:15])
+        info = fcntl.ioctl(sock, SIOCGIFADDR, packed)
+        return socket.inet_ntoa(info[20:24])
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+
+
+def karing_tun_addrs() -> frozenset[str]:
+    """IPv4 addresses configured on the tun inbound.
+
+    Cached by service_core.json mtime so the 2s poll does not parse the file.
+    """
+    global _tun_addrs_cache
+    path = KARING_DIR / "service_core.json"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return DEFAULT_TUN_ADDRS
+    cached = _tun_addrs_cache
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    addrs: set[str] = set()
+    try:
+        data = json.loads(path.read_text())
     except Exception:
+        result = DEFAULT_TUN_ADDRS
+        _tun_addrs_cache = (mtime, result)
+        return result
+    for ib in data.get("inbounds") or []:
+        if not isinstance(ib, dict) or ib.get("type") != "tun":
+            continue
+        for key in ("address", "inet4_address"):
+            for item in ib.get(key) or []:
+                host = str(item).split("/", 1)[0].strip()
+                if host:
+                    addrs.add(host)
+    result = frozenset(addrs) if addrs else DEFAULT_TUN_ADDRS
+    _tun_addrs_cache = (mtime, result)
+    return result
+
+
+def _sys_attr(name: str, attr: str) -> str:
+    try:
+        return (SYS_NET / name / attr).read_text().strip()
+    except Exception:
+        return ""
+
+
+def tun_status_of(name: str) -> TunStatus:
+    if not (SYS_NET / name).is_dir():
+        return ABSENT_TUN
+    try:
+        ifindex = int(_sys_attr(name, "ifindex") or "0")
+    except ValueError:
         ifindex = 0
+    return TunStatus(True, ifindex, _sys_attr(name, "operstate"), name)
+
+
+def tun_state() -> TunStatus:
+    """Presence of Karing's TUN, whichever tunN currently holds its address.
+
+    Watching only tun0 reports a teardown whenever another tun is already on
+    the machine (tun1 at 17:30 forced the 18:10 reconnect onto tun2).
+    """
     try:
-        operstate = (base / "operstate").read_text().strip()
-    except Exception:
-        operstate = ""
-    return True, ifindex, operstate
+        names = sorted(p.name for p in SYS_NET.iterdir() if p.name.startswith("tun"))
+    except OSError:
+        return ABSENT_TUN
+    if not names:
+        return ABSENT_TUN
+    addrs = karing_tun_addrs()
+    for name in names:
+        if iface_ipv4(name) in addrs:
+            return tun_status_of(name)
+    if TUN in names:
+        return tun_status_of(TUN)
+    return ABSENT_TUN
+
+
+def tun_transition(prev: TunStatus, curr: TunStatus) -> tuple[str, ...]:
+    """Classify one poll.  Empty unless the tunnel actually changed.
+
+    The caller MUST then take ``curr`` as the next ``prev``.  Forgetting that
+    is how 2026-09-21 18:10 turned one tun0 teardown into a DESTROYED event
+    every 2 seconds and a desktop popup every 60.
+    """
+    if prev == curr:
+        return ()
+    events: list[str] = []
+    if prev.present and not curr.present:
+        events.append("destroyed")
+    if curr.present and (
+            not prev.present
+            or prev.ifindex != curr.ifindex
+            or prev.name != curr.name):
+        events.append("rebuilt")
+    return tuple(events)
 
 
 def run(cmd: list[str], timeout: float = 6.0) -> str:
@@ -910,13 +1030,13 @@ def system_proxy() -> str:
 
 def dns_snapshot() -> list[str]:
     lines = run(["resolvectl", "status"], timeout=6.0).splitlines()
-    keep = [l for l in lines if re.search(r"tun0|enp3s0|DNS Server|Current DNS|Fallback", l)]
+    keep = [l for l in lines if re.search(r"tun\d+|enp3s0|DNS Server|Current DNS|Fallback", l)]
     return keep[:24]
 
 
 def route_snapshot() -> list[str]:
     lines = run(["ip", "-o", "route", "show", "table", "all"], timeout=6.0).splitlines()
-    keep = [l for l in lines if re.search(r"\btun0\b|\bdefault\b", l)]
+    keep = [l for l in lines if re.search(r"\btun\d+\b|\bdefault\b", l)]
     return keep[:24]
 
 
@@ -932,7 +1052,7 @@ def journal_snapshot(seconds: int = 180, limit: int = 30) -> list[str]:
     lines = run(["journalctl", "--no-pager", "-o", "short-iso", "--since", since],
                 timeout=8.0).splitlines()
     keep = [l for l in lines
-            if re.search(r"tun0|NetworkManager|karing|dhcp|carrier|resolved", l, re.I)]
+            if re.search(r"tun\d+|NetworkManager|karing|dhcp|carrier|resolved", l, re.I)]
     return keep[-limit:]
 
 
@@ -1239,26 +1359,39 @@ class Direction:
 _last_notify: dict[str, float] = {}
 
 
-def notify(category: str, summary: str, body: str, urgent: bool = True) -> bool:
+def notify(category: str, summary: str, body: str, urgent: bool = False,
+           *, expire_ms: int | None = None, cooldown: bool = True) -> bool:
     """Desktop popup for a real state change.
 
     Purely informational: it never toggles Karing.  The cooldown is per category
     and failure/recovery no longer share one budget, so a recovery popup cannot
     swallow the next genuine failure.  Every attempt and every suppression is
     logged, because a silent drop is how a popup storm gets misread.
+
+    Urgency is always ``normal`` (never ``critical``): GNOME keeps critical
+    toasts in the tray until the user clicks them, so a 60-second cooldown
+    storm looks like it is still happening minutes later.  ``transient`` stops
+    the same leftover from accumulating in the notification list.
     """
     if not NOTIFY_BIN.exists():
         return False
     now = time.monotonic()
-    if now - _last_notify.get(category, 0.0) < NOTIFY_COOLDOWN:
+    if cooldown and now - _last_notify.get(category, 0.0) < NOTIFY_COOLDOWN:
         emit("INFO", f"notify suppressed [{category}]: {summary}")
         return False
-    _last_notify[category] = now
+    if cooldown:
+        _last_notify[category] = now
+    expire = NOTIFY_EXPIRE_MS if expire_ms is None else expire_ms
+    # Never urgency=critical: GNOME keeps those in the tray until clicked, so a
+    # cooldown-spaced storm looks like it is still firing minutes later.
     try:
         proc = subprocess.run(
-            [str(NOTIFY_BIN), "-u", "critical" if urgent else "normal",
+            [str(NOTIFY_BIN),
+             "-u", "normal",
+             "-t", str(max(1, expire)),
              "-a", "tunnel-watch",
              "-h", f"string:x-canonical-private-synchronous:tunnel-watch-{category}",
+             "-h", "boolean:transient:1",
              summary, body],
             timeout=5, capture_output=True, text=True,
         )
@@ -1271,6 +1404,50 @@ def notify(category: str, summary: str, body: str, urgent: bool = True) -> bool:
         return False
     emit("INFO", f"notified [{category}]: {summary} | {body}")
     return True
+
+
+_NOTIFY_ID_RE = re.compile(r"uint32\s+(\d+)")
+
+
+def retract_notify(category: str) -> None:
+    """Take down a leftover popup under this category's replace key.
+
+    After the 2026-09-21 tun0 false-alarm storm the last critical toast sat in
+    the tray and looked like a new disconnect every time the user looked up.
+    A 1 ms transient replacement under the same synchronous key, immediately
+    closed, clears it without asking anyone to click X.
+    """
+    hint = f"tunnel-watch-{category}"
+    dict_arg = (
+        "{'urgency': <byte 0>, 'transient': <true>, "
+        f"'x-canonical-private-synchronous': <'{hint}'>"
+        "}"
+    )
+    try:
+        proc = subprocess.run(
+            ["gdbus", "call", "--session",
+             "--dest", "org.freedesktop.Notifications",
+             "--object-path", "/org/freedesktop/Notifications",
+             "--method", "org.freedesktop.Notifications.Notify",
+             "tunnel-watch", "0", "", "Karing", "",
+             "[]", dict_arg, "1"],
+            timeout=5, capture_output=True, text=True)
+        match = _NOTIFY_ID_RE.search(proc.stdout or "")
+        if match:
+            subprocess.run(
+                ["gdbus", "call", "--session",
+                 "--dest", "org.freedesktop.Notifications",
+                 "--object-path", "/org/freedesktop/Notifications",
+                 "--method", "org.freedesktop.Notifications.CloseNotification",
+                 match.group(1)],
+                timeout=5, capture_output=True, text=True)
+        elif proc.returncode != 0:
+            emit("WARN", f"retract notify failed: {(proc.stderr or proc.stdout or '')[:160]}")
+            return
+    except Exception as exc:
+        emit("WARN", f"retract notify raised: {exc!r}")
+        return
+    emit("INFO", f"notify retracted [{category}]")
 
 
 # --------------------------------------------------------------------------
@@ -1403,7 +1580,7 @@ class Watcher:
             for name, state in sorted(self.group_view.items())
         ) or "n/a"
         emit("HEARTBEAT",
-             f"procs={sorted(procs)} ports={sorted(ports)} {TUN}={tun} conns={conns} "
+             f"procs={sorted(procs)} ports={sorted(ports)} tun={tun.render()} conns={conns} "
              f"core_level={self.core.desired_level()} "
              f"core_debug_pool={self.core.debug_left():.0f}s "
              f"core_noise={counters['chatter']} budget_skipped={counters['budget_skipped']} "
@@ -1429,9 +1606,11 @@ class Watcher:
         last_discover = time.monotonic()
         self.groups = group_names()
         emit("INFO", f"baseline procs={sorted(procs)} ports={sorted(prev_ports)} "
-                     f"tun={prev_tun} groups={self.groups} "
+                     f"tun={prev_tun.render()} groups={self.groups} "
                      f"fail_threshold={FAIL_THRESHOLD} recover_threshold={RECOVER_THRESHOLD} "
                      f"debug_pool={LOG_DEBUG_BURST:.0f}s")
+        # A previous run may have left a critical toast in the tray.
+        retract_notify("tunnel")
 
         while True:
             now = time.monotonic()
@@ -1448,20 +1627,26 @@ class Watcher:
                     if gone:
                         emit("EVENT", f"ports DOWN {gone} (now {sorted(ports)})")
                     self.core.escalate("proxy ports changed", severe=bool(gone))
+                prev_ports = ports
 
+                events = tun_transition(prev_tun, tun)
                 if tun != prev_tun:
-                    emit("EVENT", f"{TUN} state {prev_tun} -> {tun}")
-                    if prev_tun[0] and not tun[0]:
-                        emit("EVENT", f"{TUN} DESTROYED (tunnel torn down)")
-                        self.core.escalate(f"{TUN} destroyed", severe=True)
-                        full_snapshot(f"{TUN} gone")
+                    label = tun.name or prev_tun.name or TUN
+                    emit("EVENT", f"{label} state {prev_tun.render()} -> {tun.render()}")
+                    if "destroyed" in events:
+                        gone_name = prev_tun.name or TUN
+                        emit("EVENT", f"{gone_name} DESTROYED (tunnel torn down)")
+                        self.core.escalate(f"{gone_name} destroyed", severe=True)
+                        full_snapshot(f"{gone_name} gone")
                         self.pending.append((time.monotonic() + CONTEXT_DELAY_SECONDS,
-                                             f"{TUN} gone: core reaction"))
+                                             f"{gone_name} gone: core reaction"))
                         notify("tunnel", "Karing 隧道已断开",
-                               f"{TUN} 被销毁，路由和 DNS 已被重置。")
-                    if tun[0] and (not prev_tun[0] or tun[1] != prev_tun[1]):
-                        emit("EVENT", f"{TUN} REBUILT ifindex={tun[1]} operstate={tun[2]}")
-                        self.core.escalate(f"{TUN} rebuilt")
+                               f"{gone_name} 被销毁，路由和 DNS 已被重置。")
+                    if "rebuilt" in events:
+                        emit("EVENT", f"{tun.name} REBUILT ifindex={tun.ifindex} "
+                                     f"operstate={tun.operstate}")
+                        self.core.escalate(f"{tun.name} rebuilt")
+                prev_tun = tun
 
                 # -- medium cadence: /proc sweep -------------------------
                 if now - last_proc >= PROC_SCAN_SECONDS:

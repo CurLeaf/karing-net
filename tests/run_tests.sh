@@ -9,7 +9,7 @@ set -u
 here=$(cd "$(dirname "$0")" && pwd)
 failed=()
 
-for test in test_port_parse.py test_reload_budget.py test_resolve.py test_watcher.py test_probe.py test_process_identity.py test_log_sink.py count_core_writes.py; do
+for test in test_port_parse.py test_reload_budget.py test_resolve.py test_watcher.py test_probe.py test_process_identity.py test_log_sink.py test_gc.py test_tun_watch.py count_core_writes.py; do
     printf '\n===== %s\n' "$test"
     if ! python3 "$here/$test"; then
         failed+=("$test")

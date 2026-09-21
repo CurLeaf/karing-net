@@ -10,17 +10,33 @@ down ~19 live connections on average per switch -- which the user experiences as
 "the network keeps dropping".
 
 sing-box itself runs these groups with ``interrupt_exist_connections = false``,
-i.e. it deliberately keeps existing sessions alive across a switch.  So the
-aggressive close was fighting the core and causing the outages.
+i.e. it deliberately keeps existing sessions alive across a switch.  The
+aggressive close was fighting the core.
+
+The opposite policy -- only recycle a node that has an explicit probe *error* --
+left healthy orphans sitting for hours.  Cursor's HTTP/2 pool (api2 / api3 /
+agentn / api2direct) opens a new generation on the new node and never closes the
+old one, so the Clash connection count climbed from an idle ~15 to 60-90 during
+an afternoon of Agent use.
 
 Current policy
 --------------
-* A URLTest switch is only *logged*, never acted upon.
-* A connection is closed only when the node it is pinned to has an explicit
-  test *error* (not merely a slow/zero delay), is no longer selected, and has
-  been alive long enough to be worth recycling.
-* Force-direct domains/IPs that somehow egress through the proxy are still
-  torn down immediately (that is the protection the helper exists for).
+* A URLTest switch is logged; the core is not asked to interrupt in-flight
+  streams (``ACTIVE_BYTES`` this tick).
+* Force-direct domains/IPs that leaked into the proxy are torn down immediately.
+* A node with an explicit probe error, that is no longer selected, loses its
+  pinned connections after ``DEAD_NODE_GRACE_SECONDS``.
+* Orphans on a *healthy* but no-longer-selected node share one quiet clock:
+  any tick below ``ACTIVE_BYTES`` (idle *or* HTTP/2 ping) continues it, and a
+  burst resets it.  After ``IDLE_LIGHT_SECONDS`` of quiet the leftover
+  generation is closed.  Cursor already opened a new generation on the new
+  node; keeping the old one was how ``api3`` pools sat on 香港 ❀原生❀… for
+  18 minutes, because idle ticks cleared the trickle clock and ping ticks
+  cleared the idle clock, so neither ``IDLE_HEAVY_SECONDS`` nor
+  ``TRICKLE_SECONDS`` ever elapsed.
+* Misroutes always close this tick.  Dead/orphan closes are capped at
+  ``CLOSE_BUDGET`` so a switch does not force the client to reconnect everything
+  at once.
 """
 from __future__ import annotations
 
@@ -33,6 +49,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -48,9 +65,18 @@ MIN_AGE_SECONDS = 3
 # A node must be failing for this long before its pinned connections are recycled.
 DEAD_NODE_GRACE_SECONDS = 20
 MISROUTE_AGE_SECONDS = 1
+# Clash has no last-active field.  A tick-to-tick jump of this many bytes is
+# treated as real traffic rather than a keepalive / HTTP/2 ping.
+ACTIVE_BYTES = 2048
+# Quiet (idle or HTTP/2 ping) on an unselected node this long -> close.
+# In-flight bursts are the only thing that keeps an old-path stream alive;
+# Cursor has already opened the next generation on the new node.
+IDLE_LIGHT_SECONDS = 24
+# Dead + orphan closes per tick.  Misroutes are not counted against this.
+CLOSE_BUDGET = 24
 API_TIMEOUT = 3
 # FakeIP CLOSE-WAIT reaping is cheap insurance but must not run on every tick.
-FAKEIP_CLEAN_EVERY_TICKS = 12
+FAKEIP_CLEAN_EVERY_TICKS = 4
 # Re-assert the URLTest anti-flapping values every ~5 minutes.
 TUNING_EVERY_TICKS = 38
 # The URLTest group list comes from the full ``/proxies`` map (11733 bytes, 65
@@ -58,6 +84,10 @@ TUNING_EVERY_TICKS = 38
 # lets the per-tick reads be just the groups plus the nodes a connection uses.
 GROUP_DISCOVERY_TICKS = 38
 FAKEIP_NETS = (ipaddress.ip_network("198.18.0.0/15"), ipaddress.ip_network("198.20.0.0/15"))
+PROTECTED_OUTBOUNDS = frozenset({
+    "direct_out", "block_out", "urltest_out",
+    "dns_direct_out", "dns_proxy_out",
+})
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("karing-gc")
@@ -94,7 +124,8 @@ def load_state() -> dict:
             return json.loads(STATE_PATH.read_text())
         except Exception:
             pass
-    return {"now": {}, "closed": 0, "misrouted": 0, "recycled": 0}
+    return {"now": {}, "closed": 0, "misrouted": 0, "recycled": 0,
+            "recycled_dead": 0, "recycled_stale": 0}
 
 
 def save_state(state: dict) -> None:
@@ -114,30 +145,49 @@ def migrate_counters(state: dict) -> bool:
     policy recycled thousands of connections.  The part that cannot be attributed
     is kept aside as ``closed_legacy`` so nothing is silently discarded, and from
     here on ``closed == misrouted + recycled`` holds on every read.
+
+    ``recycled`` later split into ``recycled_dead`` + ``recycled_stale``.  The
+    historical value was entirely dead-node closes, so the remainder goes there.
     """
+    changed = False
     if "deferred" in state:
         state["recycled"] = state.pop("deferred")
-    if "counters_migrated" in state:
-        return False
-    closed = int(state.get("closed") or 0)
-    mis = int(state.get("misrouted") or 0)
-    rec = int(state.get("recycled") or 0)
-    if closed != mis + rec:
-        state["closed_legacy"] = max(0, closed - (mis + rec))
-        state["closed"] = mis + rec
-    state["counters_migrated"] = datetime.now().isoformat(timespec="seconds")
-    return True
+        changed = True
+    if "counters_migrated" not in state:
+        closed = int(state.get("closed") or 0)
+        mis = int(state.get("misrouted") or 0)
+        rec = int(state.get("recycled") or 0)
+        if closed != mis + rec:
+            state["closed_legacy"] = max(0, closed - (mis + rec))
+            state["closed"] = mis + rec
+        state["counters_migrated"] = datetime.now().isoformat(timespec="seconds")
+        changed = True
+    if "recycled_stale" not in state or "recycled_dead" not in state:
+        rec = int(state.get("recycled") or 0)
+        stale = int(state.get("recycled_stale") or 0)
+        state["recycled_stale"] = stale
+        state["recycled_dead"] = rec - stale
+        if state["recycled_dead"] < 0:
+            state["recycled_dead"] = rec
+            state["recycled_stale"] = 0
+        changed = True
+    for key in ("closed", "misrouted", "recycled", "recycled_dead", "recycled_stale"):
+        if key not in state:
+            state[key] = 0
+            changed = True
+    return changed
 
 
 def conn_age_seconds(conn: dict) -> float:
     start = conn.get("start") or ""
     if not start:
-        return 0
+        return 0.0
     try:
         dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-        return (datetime.now(dt.tzinfo) - dt).total_seconds()
+        age = (datetime.now(dt.tzinfo) - dt).total_seconds()
+        return age if age > 0 else 0.0
     except Exception:
-        return 0
+        return 0.0
 
 
 def node_is_dead(proxy: dict | None) -> bool:
@@ -214,6 +264,119 @@ def is_proxied(conn: dict) -> bool:
     return True
 
 
+def conn_node(conn: dict) -> str:
+    chains = conn.get("chains") or []
+    return str(chains[0]) if chains else ""
+
+
+def classify_reason(reason: str) -> str:
+    if reason.startswith(("misroute", "fakeip")):
+        return "misroute"
+    if reason.startswith("dead:"):
+        return "dead"
+    return "stale"
+
+
+def apply_close_budget(
+    ids: list[str],
+    reasons: dict[str, str],
+    budget: int = CLOSE_BUDGET,
+) -> list[str]:
+    """Misroutes always close; dead/orphan closes are capped per tick.
+
+    ``ids`` is assumed to already be in priority order (misroute, dead, stale).
+    """
+    must, optional = [], []
+    for cid in ids:
+        if classify_reason(reasons.get(cid) or "") == "misroute":
+            must.append(cid)
+        else:
+            optional.append(cid)
+    return must + optional[:budget]
+
+
+@dataclass
+class ConnSample:
+    total: int
+    last_delta: int | None
+    quiet_since: float | None
+    ever_active: bool
+
+
+class TrafficBook:
+    """Byte-delta tracker so keepalives and live streams can be told apart.
+
+    Clash ``/connections`` only exposes cumulative upload+download, not
+    last-active.  One sample cannot classify a connection; two ticks can.
+
+    Idle (delta 0) and HTTP/2 pings (delta below ``ACTIVE_BYTES``) used to
+    reset each other's clocks, which is how leftover ``api3`` pools on an old
+    node survived 18 minutes: neither consecutive-idle nor consecutive-trickle
+    ever reached its threshold.  They now share one quiet clock.  Only a burst
+    of ``ACTIVE_BYTES`` or more clears it.
+    """
+
+    def __init__(self) -> None:
+        self._samples: dict[str, ConnSample] = {}
+
+    def observe(self, conns: list, now: float) -> None:
+        live: set[str] = set()
+        for c in conns:
+            cid = c.get("id")
+            if not cid:
+                continue
+            live.add(cid)
+            total = int(c.get("upload") or 0) + int(c.get("download") or 0)
+            prev = self._samples.get(cid)
+            if prev is None:
+                self._samples[cid] = ConnSample(total, None, None, False)
+                continue
+            delta = total - prev.total
+            if delta < 0:
+                delta = 0
+            ever = prev.ever_active or delta >= ACTIVE_BYTES
+            if delta >= ACTIVE_BYTES:
+                quiet_since = None
+            else:
+                quiet_since = prev.quiet_since if prev.quiet_since is not None else now
+            self._samples[cid] = ConnSample(total, delta, quiet_since, ever)
+        for cid in list(self._samples):
+            if cid not in live:
+                del self._samples[cid]
+
+    def last_delta(self, cid: str) -> int | None:
+        sample = self._samples.get(cid)
+        return None if sample is None else sample.last_delta
+
+    def quiet_seconds(self, cid: str, now: float) -> float:
+        sample = self._samples.get(cid)
+        if not sample or sample.quiet_since is None:
+            return 0.0
+        return max(0.0, now - sample.quiet_since)
+
+    def idle_seconds(self, cid: str, now: float) -> float:
+        sample = self._samples.get(cid)
+        if not sample or sample.quiet_since is None or sample.last_delta != 0:
+            return 0.0
+        return max(0.0, now - sample.quiet_since)
+
+    def trickle_seconds(self, cid: str, now: float) -> float:
+        sample = self._samples.get(cid)
+        if (not sample or sample.quiet_since is None
+                or sample.last_delta is None
+                or sample.last_delta == 0
+                or sample.last_delta >= ACTIVE_BYTES):
+            return 0.0
+        return max(0.0, now - sample.quiet_since)
+
+    def ever_active(self, cid: str) -> bool:
+        sample = self._samples.get(cid)
+        return bool(sample and sample.ever_active)
+
+
+_traffic = TrafficBook()
+
+
 class ProxyView:
     """The proxy entries this tick needs, fetched by name instead of in bulk.
 
@@ -288,7 +451,14 @@ def fetch_groups(base: str, secret: str, tick_no: int) -> tuple[dict, bool]:
     return groups, True
 
 
-def collect_close_ids(proxies: dict, conns: list, state: dict, direct: dict) -> tuple[list[str], dict[str, str]]:
+def collect_close_ids(
+    proxies,
+    conns: list,
+    state: dict,
+    direct: dict,
+    book: TrafficBook | None = None,
+    now: float | None = None,
+) -> tuple[list[str], dict[str, str]]:
     groups = {
         name: p
         for name, p in proxies.items()
@@ -298,36 +468,20 @@ def collect_close_ids(proxies: dict, conns: list, state: dict, direct: dict) -> 
     to_close: list[str] = []
     reasons: dict[str, str] = {}
 
-    # --- 1. URLTest flapping: observe only. -------------------------------
-    # Existing sessions are intentionally left alone; the core is configured
-    # with interrupt_exist_connections=false, so a switch does not require us to
-    # drop anything and dropping is what the user perceives as a disconnect.
+    # --- 1. URLTest flapping: log, then let the orphan rules drain it. ----
     for name, p in groups.items():
-        now = p.get("now") or ""
+        current = p.get("now") or ""
         old = (state.get("now") or {}).get(name) or ""
-        if old and now and old != now:
-            log.info("urltest %s switched %s -> %s (existing connections kept)", name, old, now)
-        if now:
-            state.setdefault("now", {})[name] = now
+        if old and current and old != current:
+            n_orphans = sum(1 for c in conns if conn_node(c) == old)
+            log.info(
+                "urltest %s switched %s -> %s (%s orphans; quiet-recycle %ss, in-flight kept)",
+                name, old, current, n_orphans, IDLE_LIGHT_SECONDS,
+            )
+        if current:
+            state.setdefault("now", {})[name] = current
 
-    # --- 2. Recycle sessions pinned to a node that is actively erroring. ---
-    for c in conns:
-        chains = c.get("chains") or []
-        if not chains:
-            continue
-        node = chains[0]
-        if node in selected or node in ("direct_out", "block_out", "urltest_out"):
-            continue
-        if not node_is_dead(proxies.get(node)):
-            continue
-        if conn_age_seconds(c) < DEAD_NODE_GRACE_SECONDS:
-            continue
-        cid = c.get("id")
-        if cid:
-            to_close.append(cid)
-            reasons[cid] = f"dead:{node}"
-
-    # --- 3. Force-direct traffic that leaked into the proxy. --------------
+    # --- 2. Force-direct traffic that leaked into the proxy. --------------
     suffixes = direct["domain_suffix"]
     cidrs = direct["ip_cidr"]
     for c in conns:
@@ -338,6 +492,12 @@ def collect_close_ids(proxies: dict, conns: list, state: dict, direct: dict) -> 
             continue
         hosts = conn_hosts(c)
         ip = dest_ip(c)
+        # FakeIP + a force-direct host is the more specific diagnosis; it must
+        # be checked before the generic host match, or it is unreachable.
+        if is_fake_ip(ip) and any(host_matches(h, suffixes) for h in hosts):
+            to_close.append(cid)
+            reasons[cid] = f"fakeip:{ip}"
+            continue
         matched = next((h for h in hosts if host_matches(h, suffixes)), "")
         if matched:
             to_close.append(cid)
@@ -347,9 +507,46 @@ def collect_close_ids(proxies: dict, conns: list, state: dict, direct: dict) -> 
             to_close.append(cid)
             reasons[cid] = f"misroute-ip:{ip}"
             continue
-        if is_fake_ip(ip) and any(host_matches(h, suffixes) for h in hosts):
+
+    # --- 3. Recycle sessions pinned to a node that is actively erroring. ---
+    for c in conns:
+        cid = c.get("id")
+        if not cid or cid in reasons:
+            continue
+        node = conn_node(c)
+        if not node or node in selected or node in PROTECTED_OUTBOUNDS:
+            continue
+        if not node_is_dead(proxies.get(node)):
+            continue
+        if conn_age_seconds(c) < DEAD_NODE_GRACE_SECONDS:
+            continue
+        to_close.append(cid)
+        reasons[cid] = f"dead:{node}"
+
+    # --- 4. Healthy orphans on a node that is no longer selected. ---------
+    # Quiet keepalives (idle *or* HTTP/2 ping) share one clock.  A still-
+    # transferring stream is left alone -- that is the only "don't drop the
+    # in-flight Agent response" rule.  Cursor already opened the next
+    # generation on the new node, so the leftover path drains after
+    # IDLE_LIGHT_SECONDS of no burst.
+    if book is not None and now is not None:
+        for c in conns:
+            cid = c.get("id")
+            if not cid or cid in reasons:
+                continue
+            node = conn_node(c)
+            if not node or node in selected or node in PROTECTED_OUTBOUNDS:
+                continue
+            if conn_age_seconds(c) < MIN_AGE_SECONDS:
+                continue
+            delta = book.last_delta(cid)
+            if delta is None or delta >= ACTIVE_BYTES:
+                continue
+            if book.quiet_seconds(cid, now) < IDLE_LIGHT_SECONDS:
+                continue
+            tag = "stale-trickle" if delta > 0 else "stale-idle"
             to_close.append(cid)
-            reasons[cid] = f"fakeip:{ip}"
+            reasons[cid] = f"{tag}:{node}"
 
     seen = set()
     out = []
@@ -374,7 +571,7 @@ def close_connections(base: str, secret: str, ids: list[str], reasons: dict[str,
             api(base, secret, "DELETE", f"/connections/{cid}")
             done.append(cid)
             reason = reasons.get(cid) or ""
-            if reason.startswith("misroute") or reason.startswith("fakeip"):
+            if classify_reason(reason) == "misroute":
                 log.info("closed %s %s", cid[:8], reason)
         except Exception as exc:
             log.debug("delete %s failed: %s", cid, exc)
@@ -424,7 +621,7 @@ def ensure_rules() -> None:
         log.exception("sync force-direct rules failed")
 
 
-def tick(state: dict, direct: dict) -> None:
+def tick(state: dict, direct: dict, book: TrafficBook | None = None) -> None:
     global _tick_count
     if not SERVICE_JSON.exists():
         return
@@ -441,21 +638,35 @@ def tick(state: dict, direct: dict) -> None:
         log.debug("api unavailable: %s", exc)
         return
 
+    tracker = book if book is not None else _traffic
+    now = time.monotonic()
+    tracker.observe(conns, now)
+
     # collect_close_ids also records the URLTest selection in state, so "the state
     # changed" is not the same question as "we closed something".
     before = json.dumps(state, ensure_ascii=False, sort_keys=True)
-    ids, reasons = collect_close_ids(ProxyView(base, secret, groups), conns, state, direct)
+    ids, reasons = collect_close_ids(
+        ProxyView(base, secret, groups), conns, state, direct,
+        book=tracker, now=now,
+    )
+    ids = apply_close_budget(ids, reasons)
     done = close_connections(base, secret, ids, reasons) if ids else []
     if done:
+        kinds = [classify_reason(reasons.get(cid) or "") for cid in done]
         n = len(done)
-        mis = sum(1 for cid in done if (reasons.get(cid) or "").startswith(("misroute", "fakeip")))
-        dead = n - mis
+        n_mis = kinds.count("misroute")
+        n_dead = kinds.count("dead")
+        n_stale = kinds.count("stale")
         state["closed"] = int(state.get("closed") or 0) + n
-        state["misrouted"] = int(state.get("misrouted") or 0) + mis
-        state["recycled"] = int(state.get("recycled") or 0) + dead
+        state["misrouted"] = int(state.get("misrouted") or 0) + n_mis
+        state["recycled"] = int(state.get("recycled") or 0) + n_dead + n_stale
+        state["recycled_dead"] = int(state.get("recycled_dead") or 0) + n_dead
+        state["recycled_stale"] = int(state.get("recycled_stale") or 0) + n_stale
         log.info(
-            "recycled %s connections (%s dead-node, %s misrouted; totals %s/%s)",
-            n, dead, mis, state["recycled"], state["misrouted"],
+            "recycled %s connections (%s stale, %s dead-node, %s misrouted; "
+            "totals stale=%s dead=%s mis=%s)",
+            n, n_stale, n_dead, n_mis,
+            state["recycled_stale"], state["recycled_dead"], state["misrouted"],
         )
     # Write only when something actually changed.  This used to be an
     # unconditional save every 8 s -- 10800 writes a day -- even when the URLTest
@@ -479,7 +690,10 @@ def tick(state: dict, direct: dict) -> None:
 
 def main() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log.info("karing-gc started (non-disruptive profile)")
+    log.info(
+        "karing-gc started (orphan quiet-recycle: %ss without a burst, budget %s/tick)",
+        IDLE_LIGHT_SECONDS, CLOSE_BUDGET,
+    )
     ensure_rules()
     direct = sync_rules.load_direct()
     state = load_state()

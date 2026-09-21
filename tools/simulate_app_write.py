@@ -20,7 +20,7 @@ What to look at afterwards:
   follows about 100 ms after the write, so anything under that is a win);
 * ``race`` in ``~/.local/share/karing-net/reconcile-state.json``: ``won`` should go
   up by one and ``lost`` should not;
-* ``grep -c 'tun0 REBUILT' ~/.local/share/karing-net/tunnel-watch.log`` should not
+* ``grep -c 'REBUILT ifindex=' ~/.local/share/karing-net/tunnel-watch.log`` should not
   move if the race was won.
 """
 from __future__ import annotations
@@ -54,7 +54,7 @@ def race_counts() -> dict:
 
 def rebuilt_count() -> int:
     try:
-        return sum(1 for line in TUN_LOG.read_text(errors="replace").splitlines() if "tun0 REBUILT" in line)
+        return sum(1 for line in TUN_LOG.read_text(errors="replace").splitlines() if " REBUILT ifindex=" in line)
     except Exception:
         return -1
 

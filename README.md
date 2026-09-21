@@ -8,7 +8,7 @@
 - 其它境外走默认自动选择
 - `direct.json` 里的域名写入 Karing 最高优先级自定义组 `🏠 强制直连`，DNS 走真实解析，出站走 `direct_out`
 - 系统代理绕过同一组域名，避免 Chrome 再把它们送进 `127.0.0.1:3067` 后落到默认节点
-- `karing-gc` 在自动切换节点后关掉旧连接；只回收 Fake-IP 的 CLOSE-WAIT；发现强制直连域名误走代理时立刻拆掉
+- `karing-gc` 回收旧节点上已经空闲/在滴流量的连接，在途流量不动；只回收 Fake-IP 的 CLOSE-WAIT；发现强制直连域名误走代理时立刻拆掉
 
 这些域名不在 `geosite:cn` 里。Chrome 走系统代理时只有域名、没有 IP，会掉进默认 `urltest_out`，再被日本/新加坡节点拒绝，表现为 `ERR_CONNECTION_CLOSED`。
 
@@ -79,10 +79,13 @@ python3 /home/yxw/Projects/karing-net/sync_rules.py check
   - **宽限期有上限，时钟回拨不能把它变成"无限等"。** `verify_at` 必须能跨服务重启，所以只能存墙钟时间，而时钟可能在它下面移动。若 NTP 把时钟往回调，这个截止时间会在"未来"停留与回拨时长相同的时间，而 `resolve_reload` 在它到期前**拒绝做探针**——于是一份"App 那次 reload 没带上修正"的配置会长时间没人验证。现在 `verify_deadline()` 只认 `VERIFY_GRACE_MAX_SECONDS`（30 秒）以内的截止时间，更远的按"没有宽限"处理、立刻探针。（循环间隔本来就被 `min(POLL_SECONDS, remaining)` 夹住，所以回拨不会像 20:04 那样把循环钉在 0.2 秒下限刷日志；那次是截止时间停在**过去**造成的，是另一个已修的问题。）
   - **一次补写会写两遍 `service_core.json`**（实测间隔 1.7 ms）：`ensure_svcb_rule` 先落规则、`ensure_derived_tuning` 再落 tuning。type 65 规则在第一遍就在，所以中间态是可用的；但它不是原子的，App 的 reload 若正好落在两遍中间，读到的是"有规则、tuning 还是旧值"的版本，下一轮会再补一次。`tests/count_core_writes.py` 把这个间隔量出来并盯着别涨。
 - `karing-gc.service`：连接回收 + urltest 防抖，启动命令 `karing-gc.py`。状态 `~/.local/share/karing-net/gc-state.json`。
+  - **切节点后回收孤儿，不拆在途流量。** Clash `/connections` 没有 last-active，只有累计 `upload`/`download`，所以按 tick 之间的字节增量分类。空闲和 HTTP/2 心跳（都低于 `ACTIVE_BYTES` 2 KB/tick）共用一座安静时钟，只有突发才清零——旧版把空闲和心跳分成两座钟，结果互相重置，切到 `香港-优化2` 之后 `api3` 池在上一跳上挂了 18 分钟。未选中节点上安静 `IDLE_LIGHT_SECONDS`（24s）就关；这一 tick 还在大流量传输的不动。Cursor 会在新节点开下一代连接，旧路径上的 Agent 流也按安静时钟收，不再为工具调用停顿额外留 180s。误走强制直连的立刻拆；死节点仍是 20s。误路由不受每 tick `CLOSE_BUDGET`（24）限制，其它回收受它限制，避免一次切节点让客户端同时重连几十条。旧的"一切换就清连接"平均每次拆 19 条、表现为上网闪断；只关探测报错的死节点则让连接数从空闲的十几条堆到 60–90。`tests/test_gc.py` 钉住这条分界。
   - **按需读单个代理，不拉全量 `/proxies`。** 它只需要两类信息：URLTest 组的 `type`/`now`，以及当前连接 `chains[0]` 里那几个节点的 `history`。旧版每 8 秒拉一次全量 `/proxies`（本机实测 11733 字节 / 65 项），换成 `/proxies/<name>` 后代理部分降到 2,694 字节（约 −84%，折算每日约 182 MB → 29 MB）。组名仍取自全量 `/proxies`，但只在每 `GROUP_DISCOVERY_TICKS`（38 个 tick，约 5 分钟）重新发现一次。剩下的 `/connections`（实测 18,185 字节）是每轮都必须看的大头，降不掉。读不到任何组时这一轮**直接跳过**，而不是在"不知道当前选中哪个节点"的情况下动手——`selected` 正是保护在线节点会话的东西。
   - **状态只在真的变了才落盘。** 旧版两个分支都写 `gc-state.json`，8 秒一次、每天 10800 次，即使选中节点和三个计数器都没变。现在比较序列化结果，相同就不写。注意"状态变了"和"关过连接"不是同一个问题：`collect_close_ids` 也会把 URLTest 选中项记进 state。
-  - **计数器可核对。** `deferred` 这个名字是错的——它存的是死节点回收数（`dead = n - mis`），而不是"被推迟"的连接。而且在本机三者也确实对不上：`closed` 是 3052，而 `misrouted` 是 0、`deferred` 是 6，因为 `closed` 从"一切换就清连接"的旧策略时代就开始累积，另两个是那之后才有的。读到 3052 只会以为现行策略回收过三千多条连接。现在改名为 `recycled`，无法归因的那部分挪进 `closed_legacy`（本机 3046，不静默丢弃），并记一个 `counters_migrated` 时间戳；从这次起 `closed == misrouted + recycled` 恒成立。`close_connections()` 也从"返回条数"改成"返回真正关掉的 id 列表"，于是一个失败的 DELETE 不会被算进任何一类。
-- `tunnel-watch.service`：只读掉线记录器，启动命令 `tunnel-watch.py`。它只读 `/proc`、Clash API 和网络状态，不改 Karing 任何配置，日志写在 `~/.local/share/karing-net/tunnel-watch.log`。每次 `tun0` 销毁重建、进程重启、端口变化、节点切换、方向不可用都会连当时的路由、DNS、系统日志和内核日志一起落盘，用于回答"这次到底为什么断"；真实中断和恢复各弹一次桌面通知。
+  - **计数器可核对。** `deferred` 这个名字是错的——它存的是死节点回收数（`dead = n - mis`），而不是"被推迟"的连接。而且在本机三者也确实对不上：`closed` 是 3052，而 `misrouted` 是 0、`deferred` 是 6，因为 `closed` 从"一切换就清连接"的旧策略时代就开始累积，另两个是那之后才有的。读到 3052 只会以为现行策略回收过三千多条连接。现在改名为 `recycled`，无法归因的那部分挪进 `closed_legacy`（本机 3046，不静默丢弃），并记一个 `counters_migrated` 时间戳；从这次起 `closed == misrouted + recycled` 恒成立。`recycled` 再拆成 `recycled_dead` + `recycled_stale`（历史值全部记到 `recycled_dead`）。`close_connections()` 也从"返回条数"改成"返回真正关掉的 id 列表"，于是一个失败的 DELETE 不会被算进任何一类。
+- `tunnel-watch.service`：只读掉线记录器，启动命令 `tunnel-watch.py`。它只读 `/proc`、Clash API 和网络状态，不改 Karing 任何配置，日志写在 `~/.local/share/karing-net/tunnel-watch.log`。每次隧道网卡销毁重建、进程重启、端口变化、节点切换、方向不可用都会连当时的路由、DNS、系统日志和内核日志一起落盘，用于回答"这次到底为什么断"；真实中断和恢复各弹一次桌面通知。
+  - **状态指针每轮都要推进。** 旧版本比较了 `tun != prev_tun` 却从不把 `prev_tun` 改成当前值。基线若是「网卡在」（本机 2026-09-21 09:42 是 tun0 ifindex 5），之后被拆掉，每一轮 2 秒采样都会再报一次 DESTROYED，桌面通知按 60 秒限流反复弹出。2026-09-21 18:10 Karing 重连落到 tun2 之后就是这样：隧道其实还在，弹窗不是在报新的断开。进程集合早就按「连续两次一致才认」处理过同一类问题，网卡状态漏了。
+  - **认的是 Karing 的地址，不是网卡名 `tun0`。** 核心配置里 `interface_name` 是空的，内核按空闲序号发 `tunN`。本机 17:30 已经有别的程序占了 `tun1`，18:10 重连 Karing 拿到的是 `tun2`（`10.20.0.1/30`）。只盯 `tun0` 会把这次重连看成永久断开。
   - **探针在进程内做，分阶段计时。** 早期版本是 `curl -m 6`，每 6 秒 fork 两次，并且把 curl 的退出码丢掉——于是"端口没人监听"、"握手卡死"、"状态码不对"全都变成同一个字符串 `000`。现在是纯 Python：连本机代理端口（`tcp`）、代理的 `CONNECT`（`connect`）、TLS 握手（`tls`）、请求到状态行（`http`），每段各自计时，失败带 `kind`（`port_closed` / `connect_timeout` / `tls_cert` / `http_status` …）和阶段名，日志和通知都用它。**卡住的阶段也会记耗时**，所以"瞬时被拒"和"卡满 10 秒"能分辨。
   - **判定用迟滞，不靠单次采样。** 连续 `FAIL_THRESHOLD`（3）次失败才判定不可用，连续 `RECOVER_THRESHOLD`（2）次成功才判定恢复。10 秒一次采样意味着：内核重启 5 秒就回来的一次都不弹窗；真断线约 30 秒内报出来。单次失败只写日志、并从一个有额度的池子里买一段 `debug` 窗口抓现场，不打扰人。之前的 6 秒硬阈值正好压在健康样本的分布上——实测 72 次成功里有 18 次慢于 4 秒，最近的一条是 5.993s，也就是说 0.009 秒的抖动决定了"慢"还是"失败"。
   - **判定不可用时先确认范围。** 触发 down 时会用第二个目标（`cp.cloudflare.com`）复测一次：如果它通，通知就说"只有 `<目标>` 这条线路异常"，而不是笼统地说代理挂了；报文中还会带上当前选中节点、失败原因和阶段。
@@ -114,10 +117,10 @@ python3 /home/yxw/Projects/karing-net/sync_rules.py check    # 规则是否都�
 python3 /home/yxw/Projects/karing-net/karing-reconcile.py --once --dry-run
 dig +short -t HTTPS www.google.com                          # type 65 是否真的通
 tail -f ~/.local/share/karing-net/reconcile.log
-grep -c 'tun0 REBUILT' ~/.local/share/karing-net/tunnel-watch.log        # 一次重连本该只加一次（甚至零次）
+grep -c 'REBUILT ifindex=' ~/.local/share/karing-net/tunnel-watch.log    # 一次重连本该只加一次（甚至零次）
 ```
 
-`selfcheck.py` 的第 8 段直接读 `reconcile-state.json`：`reconciles` / `reloads` / `failures` / `race` 胜负 / `pending_reload` / `reload_attempts` / `last_probe`。`last_probe.ok` 为 false、或 `pending_reload` 长期是 true，都说明**运行中的内核没有拿到修正**，与磁盘上的文件无关。
+`selfcheck.py` 的第 8 段直接读 `reconcile-state.json`：`reconciles` / `reloads` / `failures` / `race` 胜负 / `pending_reload` / `reload_attempts` / `last_probe`。`last_probe.ok` 为 false、或 `pending_reload` 长期是 true，都说明**运行中的内核没有拿到修正**，与磁盘上的文件无关。第 9 段读 `gc-state.json`，核 `closed == misrouted + recycled` 和 `recycled == recycled_dead + recycled_stale`。
 
 `scan_cn.py` 是从 Chrome 历史里找域名、给 `direct.json` 提候选的辅助脚本，用法见它自己的 docstring（`--live` 看内核当前连接，`--suggest` 直接吐一个 `direct.json` 片段）。
 
@@ -138,6 +141,8 @@ bash /home/yxw/Projects/karing-net/tests/run_tests.sh
 - `test_probe.py`：探针的失败分类和判定迟滞。只在临时端口的本地监听上跑（含自签证书的 TLS 监听和一个可指定故障模式的假 CONNECT 代理），所以可以挨着线上服务跑。它验两件事：端口未监听 / CONNECT 被驳回 / 握手停滞 / 证书不可信 / 状态码非预期必须给出**五种不同的 kind**（这是旧版 `000` 吞掉的区别），以及失败不满 3 次、恢复不满 2 次都不能改变判定。
 - `count_core_writes.py`：在临时 HOME 里复制一份数据目录，数一次补写写了 `service_core.json` 几遍、间隔多少毫秒。
 - `test_process_identity.py`：进程身份的两道关，以及 `debug` 窗口的额度池。四种伪装进程——Cursor 那种把命令文本塞进 argv 的 shell、名字只出现在后续 argv 项里的解释器、`argv[0]` 被改写成内核名的、以及**真有一个文件叫 `karingService`**——都必须被拒。最后一种要在 `~/.cache` 下构造（`/tmp` 是 noexec）且二进制不能按 `argv[0]` 分发（本机 `/bin/sleep` 是 coreutils 多合一，改名后直接报 `unknown program`），所以用解释器的副本；用例会先断言名字这一层**确实接受**它，以此证明拦住它的是 `core_proof()`，并再断言真内核仍被接受、且它的 `exe` 确实不可读。它会临时改写 `emit`，免得把"拒绝了谁"写进线上日志。
+- `test_gc.py`：连接回收的分界。当前选中节点和 `direct_out` 上的空闲连接必须留下；未选中节点上安静 24s（空闲或 HTTP/2 心跳，两座钟不能互相清零）必须关；还在传 `ACTIVE_BYTES` 的孤儿不能关；死节点即使在传也关、但正在选中的死节点不关；误路由仍立刻关且不受 `CLOSE_BUDGET` 限制。不碰 Clash API，也不写 `gc-state.json`。
+- `test_tun_watch.py`：网卡状态指针必须推进（同一 teardown 不能每轮再报 DESTROYED），并且按 `10.20.0.1` 认 Karing 的 tun，不能把旁边的 `tun1` 当成隧道。
 
 会写真实 `service_core.json` 的端到端抢写测试故意不放在这里：它可能让这一轮多一次 reload、把 `tun0` 拆了重建，所以放在 `tools/` 下并加了 `--yes` 确认：
 
@@ -145,7 +150,7 @@ bash /home/yxw/Projects/karing-net/tests/run_tests.sh
 python3 ~/Projects/karing-net/tools/simulate_app_write.py --yes
 ```
 
-它按 App 的写法（原地 `O_TRUNC`）把 type-65 规则抹掉，量补写恢复的毫秒数，跑完对照 `race` 计数和 `grep -c 'tun0 REBUILT'`：正常的重连和这个模拟都应该是 `won` 涨 1、`lost` 不动、`tun0 REBUILT` 不涨。
+它按 App 的写法（原地 `O_TRUNC`）把 type-65 规则抹掉，量补写恢复的毫秒数，跑完对照 `race` 计数和 `grep -c 'REBUILT ifindex='`：正常的重连和这个模拟都应该是 `won` 涨 1、`lost` 不动、REBUILT 不涨。
 
 ## 抓写入者
 
