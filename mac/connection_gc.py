@@ -21,7 +21,15 @@ PROTECTED = {'direct_out', 'block_out', 'dns_direct_out', 'dns_proxy_out'}
 
 def age(start: str) -> float:
     try:
-        return max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(start)).total_seconds())
+        value = start.replace('Z', '+00:00')
+        # Clash emits nanosecond timestamps; Python 3.9 parses only six
+        # fractional digits, so truncate excess precision before parsing.
+        value = re.sub(r'\.(\d{6})\d+(?=(?:[+-]\d{2}:?\d{2})$)', r'.\1', value)
+        value = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', value)
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds())
     except (ValueError, TypeError):
         return 0.0
 

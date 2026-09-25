@@ -49,6 +49,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -183,7 +184,12 @@ def conn_age_seconds(conn: dict) -> float:
     if not start:
         return 0.0
     try:
-        dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        value = start.replace("Z", "+00:00")
+        # Clash emits nanosecond timestamps, while Python 3.9 accepts at most
+        # microseconds.  Keep the timezone and truncate only excess digits.
+        value = re.sub(r"\.(\d{6})\d+(?=(?:[+-]\d{2}:?\d{2})$)", r".\1", value)
+        value = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", value)
+        dt = datetime.fromisoformat(value)
         age = (datetime.now(dt.tzinfo) - dt).total_seconds()
         return age if age > 0 else 0.0
     except Exception:
