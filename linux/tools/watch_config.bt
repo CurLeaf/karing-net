@@ -7,7 +7,7 @@
 // file the app itself writes.
 //
 // Usage:
-//     sudo bpftrace ~/Projects/karing-net/tools/watch_config.bt \
+//     sudo bpftrace ~/Projects/karing-net/linux/tools/watch_config.bt \
 //         $(pgrep -f '/opt/karing/karing$') | tee -a ~/.local/share/karing-net/config-writes.log
 //
 // The pid argument is the Karing GUI process.  It is optional: without it the

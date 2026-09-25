@@ -12,7 +12,7 @@ so this can cost one network blip for everything going through the tunnel.
 
 Run it only when a blip is acceptable, and always with ``--yes``:
 
-    python3 ~/Projects/karing-net/tools/simulate_app_write.py --yes
+    python3 ~/Projects/karing-net/linux/tools/simulate_app_write.py --yes
 
 What to look at afterwards:
 

@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+direct.json
+.sync_rules.lock
+backup/
+.vfox/

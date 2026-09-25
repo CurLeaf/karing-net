@@ -1,0 +1,11 @@
+{
+  "diversion_group": [
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "🍎 苹果服务",
+      "server_groupid": "direct",
+      "server_name": "direct_out",
+      "dns_servers": []
+    }
+  ]
+}
