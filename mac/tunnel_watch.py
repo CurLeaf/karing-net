@@ -132,15 +132,20 @@ class Watcher:
                     self.probes = {'proxy': a.result(), 'direct': b.result()}
                 for name, result in self.probes.items():
                     detail = result['error'] or 'HTTP 探测成功'
-                    if not result['ok'] and self.health[name].failures == 2:
+                    effective_ok = result['ok']
+                    if not result['ok']:
                         secondary = http_probe(
                             'https://cp.cloudflare.com/generate_204' if name == 'proxy' else 'https://www.apple.com/',
                             ports['mixed_in_rule' if name == 'proxy' else 'mixed_in_direct'],
                             (204,) if name == 'proxy' else (200, 301, 302))
                         result['secondary'] = secondary
-                        detail = ('仅主探测目标异常；备用目标可达' if secondary['ok']
-                                  else '主、备用探测目标均异常') + '；' + detail
-                    self.transition(name, result['ok'], detail)
+                        if secondary['ok']:
+                            effective_ok = True
+                            detail = '仅主探测目标异常；备用目标可达；' + detail
+                            self.log.warning('%s target degraded: %s', name, detail)
+                        else:
+                            detail = '主、备用探测目标均异常；' + detail
+                    self.transition(name, effective_ok, detail)
                 if self.probes['proxy']['ok'] != self.probes['direct']['ok']:
                     self.log.info('path divergence proxy=%s direct=%s', self.probes['proxy']['ok'], self.probes['direct']['ok'])
             except Exception as exc:

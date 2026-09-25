@@ -226,6 +226,15 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(health.note(ok))
         self.assertEqual(health.state, 'up')
 
+    def test_secondary_target_keeps_proxy_up(self):
+        health = watch.Health()
+        for ok in (True, True, True):
+            self.assertIsNone(health.note(ok))
+        # A primary-target timeout with a healthy fallback is treated as an
+        # endpoint degradation, not a proxy outage.
+        self.assertIsNone(health.note(True))
+        self.assertEqual(health.state, 'up')
+
 
 class SyncTests(unittest.TestCase):
     def setUp(self):
