@@ -174,6 +174,36 @@ class RuntimeTests(unittest.TestCase):
             factory.assert_called_once_with('127.0.0.1', 3057, timeout=4.0)
             http.close.assert_called_once()
 
+    def test_select_proxy_uses_clash_api(self):
+        with patch.object(km, 'api_request', return_value=(204, None)) as api:
+            km.select_proxy('pool', 'new')
+        api.assert_called_once_with('/proxies/pool', 'PUT', b'{"name":"new"}')
+
+    def test_next_proxy_candidate_rotates_and_skips_blocked(self):
+        group = {'now': 'old', 'all': ['old', 'blocked', 'new'], 'type': 'URLTest'}
+        with patch.object(watch, 'FAILED_NODE_COOLDOWN', 60):
+            self.assertEqual(watch.next_proxy_candidate(group, {'blocked': 150}, 200), 'new')
+            self.assertIsNone(watch.next_proxy_candidate(group, {'blocked': 150, 'new': 150}, 200))
+
+    def test_auto_switch_marks_current_node_and_uses_api(self):
+        watcher = watch.Watcher(notifications=False)
+        group = {'now': 'old', 'all': ['old', 'new'], 'type': 'URLTest'}
+        with patch.object(watch, 'AUTO_SWITCH_ENABLED', True), patch.object(km, 'select_proxy') as select:
+            result = watcher.maybe_switch_proxy({'urltest_out': group}, 1000, '吞吐不足')
+        self.assertEqual(result['to'], 'new')
+        select.assert_called_once_with('urltest_out', 'new')
+        self.assertEqual(watcher.failed_nodes['old'], 1000)
+
+    def test_throughput_probe_parses_speed_and_threshold(self):
+        process = Mock(returncode=0, stdout='200 262144 1.0', stderr='')
+        with patch.object(watch.subprocess, 'run', return_value=process):
+            result = watch.throughput_probe(port=3067)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['bytes_per_second'], 262144)
+        process = Mock(returncode=0, stdout='200 262144 2.0', stderr='')
+        with patch.object(watch.subprocess, 'run', return_value=process):
+            self.assertFalse(watch.throughput_probe(port=3067)['ok'])
+
     def collector(self, apply):
         with patch.object(km, 'logger', return_value=Mock()):
             return gc.Collector(apply)

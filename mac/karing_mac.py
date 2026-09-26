@@ -82,6 +82,14 @@ def proxy_path(name: str) -> str:
     return '/proxies/' + quote(name, safe='')
 
 
+def select_proxy(group: str, target: str) -> None:
+    """Select a member of a Clash-compatible proxy group through the API."""
+    if not isinstance(group, str) or not group or not isinstance(target, str) or not target:
+        raise ValueError('proxy group and target are required')
+    body = json.dumps({'name': target}, ensure_ascii=False, separators=(',', ':')).encode()
+    api_request(proxy_path(group), 'PUT', body)
+
+
 def connections() -> list[dict]:
     payload = api_json('/connections')
     if not isinstance(payload, dict) or not isinstance(payload.get('connections'), list):
