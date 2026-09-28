@@ -1463,6 +1463,17 @@ class Watcher:
         self.pending: list[tuple[float, str]] = []
         self.divergence = ""
 
+    def refresh_groups(self) -> None:
+        """Discover groups without making temporary API unavailability fatal."""
+        try:
+            discovered = group_names()
+        except Exception as exc:
+            emit("WARN", f"group discovery failed: {exc!r}; will retry")
+            return
+        if discovered != self.groups:
+            emit("INFO", f"groups {self.groups} -> {discovered}")
+            self.groups = discovered
+
     # -- node attribution -------------------------------------------------
     def node_summary(self) -> str:
         if not self.group_view:
@@ -1604,7 +1615,7 @@ class Watcher:
         prev_sysproxy = system_proxy()
         last_proc = last_probe = last_group = last_heartbeat = 0.0
         last_discover = time.monotonic()
-        self.groups = group_names()
+        self.refresh_groups()
         emit("INFO", f"baseline procs={sorted(procs)} ports={sorted(prev_ports)} "
                      f"tun={prev_tun.render()} groups={self.groups} "
                      f"fail_threshold={FAIL_THRESHOLD} recover_threshold={RECOVER_THRESHOLD} "
@@ -1675,10 +1686,7 @@ class Watcher:
                     last_group = now
                     if not self.groups or now - last_discover >= GROUP_REDISCOVER_SECONDS:
                         last_discover = now
-                        discovered = group_names()
-                        if discovered != self.groups:
-                            emit("INFO", f"groups {self.groups} -> {discovered}")
-                            self.groups = discovered
+                        self.refresh_groups()
                     if self.groups:
                         state = group_state(self.groups)
                         for name, new in state.items():

@@ -48,6 +48,17 @@ GPT_KEEP_TAGS = ("台湾-优化2-GPT", "美国LA-优化2-GPT", "美国LA-优化3
 # The urltest outbound Karing builds from that group inside the generated config.
 GPT_OUTBOUND = "urltest_out-GPT自动"
 
+# 囡囡喵.com resolves to a Fastweb address in Rome.  Direct from this LAN times out
+# or is reset during TLS, so it has to stay on a proxy.  The default urltest picks
+# by gstatic delay, and the Hong Kong node that wins that test is slow to Rome
+# (measured 2026-09-24: 香港WAP-优化2 timed out, 大豆豆 933 ms, 小豆豆 464 ms,
+# 英国-优化2 340 ms, 德国-优化2 351 ms).  The group probes the site itself.
+PANEL_GROUP = "囡囡喵面板"
+PANEL_SUFFIXES = ["xn--i2r10aa.com"]
+PANEL_TAGS = ("英国-优化2", "德国-优化2")
+PANEL_OUTBOUND = "urltest_out-囡囡喵面板"
+PANEL_URL = "https://xn--i2r10aa.com/"
+
 # ---- SVCB / HTTPS (type 65) DNS queries ------------------------------------
 # fakeip can only answer A/AAAA, but the per-group DNS rules match on domain
 # alone, so for e.g. geosite:google they swallow SVCB/HTTPS queries too.  The
@@ -395,6 +406,146 @@ def tune_gpt_group() -> dict:
     return changed
 
 
+def tune_panel_group() -> dict:
+    """Keep a urltest whose members are the nodes that answer the Rome panel."""
+    if not SUBSCRIBE_PATH.exists():
+        return {}
+    data = load_json(SUBSCRIBE_PATH)
+    changed: dict[str, tuple] = {}
+    for item in data.get("items") or []:
+        groups = item.setdefault("urltests", [])
+        if not any(g.get("remark") == GPT_GROUP for g in groups) and item.get("remark") != "自定义":
+            continue
+        current = next((g for g in groups if g.get("remark") == PANEL_GROUP), None)
+        wanted_tags = list(PANEL_TAGS)
+        if current is None:
+            groups.append({"remark": PANEL_GROUP, "tags": wanted_tags, "regexs": []})
+            changed["added"] = (None, wanted_tags)
+        else:
+            if list(current.get("tags") or []) != wanted_tags:
+                changed["tags"] = (current.get("tags"), wanted_tags)
+                current["tags"] = wanted_tags
+            if current.get("regexs"):
+                changed["regexs"] = (current.get("regexs"), [])
+                current["regexs"] = []
+        break
+    if changed:
+        dump_json(SUBSCRIBE_PATH, data)
+    return changed
+
+
+def upsert_panel_routing() -> bool:
+    data = load_json(ROUTING_PATH)
+    items = data.setdefault("items", [])
+    if not items:
+        items.append({"groupid": GROUP_ID, "urlOrPath": "", "remark": "自定义", "editAble": True, "groups": []})
+    groups = items[0].setdefault("groups", [])
+    wanted = {
+        "groupid": GROUP_ID,
+        "name": PANEL_GROUP,
+        "type": "",
+        "or": True,
+        "domain_suffix": list(PANEL_SUFFIXES),
+    }
+    current = next((g for g in groups if g.get("name") == PANEL_GROUP), None)
+    if current is None:
+        groups.append(wanted)
+        dump_json(ROUTING_PATH, data)
+        return True
+    if list(current.get("domain_suffix") or []) != list(PANEL_SUFFIXES):
+        current.update(wanted)
+        dump_json(ROUTING_PATH, data)
+        return True
+    return False
+
+
+def upsert_panel_use() -> bool:
+    data = load_json(USE_PATH)
+    rows = data.setdefault("diversion_group", [])
+    wanted = {
+        "diversion_groupid": GROUP_ID,
+        "diversion_name": PANEL_GROUP,
+        "server_groupid": "urltest",
+        "server_name": PANEL_GROUP,
+        "dns_servers": [],
+    }
+    current = next((r for r in rows if r.get("diversion_name") == PANEL_GROUP), None)
+    changed = False
+    if current is None:
+        insert_at = 1 if rows and rows[0].get("diversion_groupid") != "final" else 0
+        rows.insert(insert_at, wanted)
+        changed = True
+    elif current.get("server_name") != PANEL_GROUP or current.get("server_groupid") != "urltest":
+        current.update(wanted)
+        changed = True
+    if changed:
+        dump_json(USE_PATH, data)
+    return changed
+
+
+def _panel_outbound() -> dict:
+    return {
+        "type": "urltest",
+        "tag": PANEL_OUTBOUND,
+        "interrupt_exist_connections": False,
+        "outbounds": list(PANEL_TAGS),
+        "url": PANEL_URL,
+        "interval": "5m",
+        "tolerance": TUNING["tolerance"],
+        "idle_timeout": "5m",
+    }
+
+
+def _panel_route() -> dict:
+    return {
+        "rules": [{"domain_suffix": list(PANEL_SUFFIXES)}],
+        "outbound": PANEL_OUTBOUND,
+        "action": None,
+        "name": f"{PANEL_GROUP}[自定义]",
+        "type": "logical",
+        "mode": "or",
+    }
+
+
+def ensure_panel_core() -> dict:
+    """Route the Rome panel to its own urltest, ahead of the default proxy rule."""
+    if not CORE_PATH.exists():
+        return {}
+    data = load_json(CORE_PATH)
+    changed: dict = {}
+    outbounds = data.setdefault("outbounds", [])
+    tags = {ob.get("tag") for ob in outbounds}
+    missing = [tag for tag in PANEL_TAGS if tag not in tags]
+    if missing:
+        return {"skipped": f"node definitions missing: {missing}"}
+    current = next((ob for ob in outbounds if ob.get("tag") == PANEL_OUTBOUND), None)
+    wanted = _panel_outbound()
+    if current is None:
+        outbounds.append(wanted)
+        changed["outbound"] = "added"
+    elif list(current.get("outbounds") or []) != list(PANEL_TAGS) or current.get("url") != PANEL_URL:
+        current.clear()
+        current.update(wanted)
+        changed["outbound"] = "updated"
+    rules = data.setdefault("route", {}).setdefault("rules", [])
+    route = _panel_route()
+    existing = next((r for r in rules if r.get("name") == route["name"]), None)
+    if existing is None:
+        wall = next((i for i, r in enumerate(rules) if "国外穿墙" in str(r.get("name") or "")), len(rules))
+        rules.insert(wall, route)
+        changed["route"] = "added"
+    elif existing.get("outbound") != PANEL_OUTBOUND or _collect_suffixes(existing) != set(PANEL_SUFFIXES):
+        existing.clear()
+        existing.update(route)
+        changed["route"] = "updated"
+    if changed:
+        ok, why = urltest_rules_are_sane(data)
+        if not ok:
+            return {"skipped": why}
+        dump_json(CORE_PATH, data)
+    return changed
+
+
 def ensure_svcb_rule() -> dict:
     """Give SVCB/HTTPS (type 65) queries a resolver that can answer them."""
     if not CORE_PATH.exists():
@@ -541,6 +692,7 @@ def reconcile() -> dict:
     result = apply()
     with lock():
         result["gpt_members"] = ensure_gpt_members()
+        result["panel_core"] = ensure_panel_core()
         result["derived_tuning"] = ensure_derived_tuning()
     return result
 
@@ -558,10 +710,14 @@ def _apply(include_core: bool = True) -> dict:
         "bypass": upsert_bypass(direct),
         "tuning": bool(ensure_tuning()),
         "gpt_group": tune_gpt_group(),
+        "panel_group": tune_panel_group(),
+        "panel_routing": upsert_panel_routing(),
+        "panel_use": upsert_panel_use(),
     }
     if include_core:
         result["core"] = upsert_core(direct)
         result["svcb"] = ensure_svcb_rule()
+        result["panel_core"] = ensure_panel_core()
     return result
 
 
@@ -573,12 +729,14 @@ def check() -> int:
     use = load_json(USE_PATH)
     mapped = next((r for r in use.get("diversion_group") or [] if r.get("diversion_name") == direct["group_name"]), None)
 
-    core_ok = svcb_ok = gpt_ok = tuning_ok = sane = True
+    core_ok = svcb_ok = gpt_ok = tuning_ok = sane = panel_ok = True
     detail = {}
     if CORE_PATH.exists():
         core = load_json(CORE_PATH)
         names = [r.get("name") for r in (core.get("route") or {}).get("rules") or []]
         core_ok = f"{direct['group_name']}[自定义]" in names
+        panel_ok = f"{PANEL_GROUP}[自定义]" in names
+        detail["panel"] = "ok" if panel_ok else "missing"
         detail["svcb"] = svcb_rule_problem(core) or "ok"
         svcb_ok = detail["svcb"] == "ok"
         for ob in core.get("outbounds") or []:
@@ -595,13 +753,14 @@ def check() -> int:
             detail["config"] = why
 
     ok = (bool(group) and bool(mapped) and mapped.get("server_name") == SERVER_NAME
-          and core_ok and svcb_ok and gpt_ok and tuning_ok and sane)
+          and core_ok and svcb_ok and gpt_ok and tuning_ok and sane and panel_ok)
     print("group", "ok" if group else "missing")
     print("mapping", "ok" if mapped else "missing")
     print("core", "ok" if core_ok else "missing")
     print(f"{GPT_GROUP} members", detail.get("gpt_members", "ok" if gpt_ok else "missing"))
     print("tuning", "ok" if tuning_ok else detail.get("tolerance"))
     print("svcb rule", detail.get("svcb", "ok"))
+    print(PANEL_GROUP, detail.get("panel", "ok" if panel_ok else "missing"))
     if not sane:
         print("config", detail["config"])
     if group:
