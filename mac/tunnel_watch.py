@@ -72,19 +72,36 @@ def throughput_probe(url=THROUGHPUT_URL, port=None, expected=(200, 206)):
                 'bytes_per_second': 0, 'error': str(exc)[:160]}
 
 
+def is_valid_proxy_node(name: str) -> bool:
+    """Check if a node name is a valid proxy (not a special node)."""
+    if not isinstance(name, str) or not name:
+        return False
+    # Exclude subscription info nodes and special outbounds
+    exclude_patterns = [
+        '剩余流量', '到期时间', '套餐', '更新时间', '官网地址',
+        'DIRECT', 'REJECT', 'PASS', 'GLOBAL'
+    ]
+    name_lower = name.lower()
+    return not any(pattern.lower() in name_lower for pattern in exclude_patterns)
+
+
 def next_proxy_candidate(group: dict, failed: dict[str, float], now: float) -> str | None:
-    """Return the next unblocked member after the current selection."""
+    """Return the next unblocked valid proxy member after the current selection."""
     current = group.get('now')
     members = group.get('all') or []
     if not isinstance(current, str) or not current or not isinstance(members, list):
         return None
+    # Filter to valid proxy nodes only
+    valid_members = [m for m in members if isinstance(m, str) and is_valid_proxy_node(m)]
+    if not valid_members:
+        return None
     try:
-        start = members.index(current)
+        start = valid_members.index(current)
     except ValueError:
         start = -1
-    for offset in range(1, len(members) + 1):
-        candidate = members[(start + offset) % len(members)]
-        if isinstance(candidate, str) and candidate != current and now - failed.get(candidate, -float('inf')) >= FAILED_NODE_COOLDOWN:
+    for offset in range(1, len(valid_members) + 1):
+        candidate = valid_members[(start + offset) % len(valid_members)]
+        if candidate != current and now - failed.get(candidate, -float('inf')) >= FAILED_NODE_COOLDOWN:
             return candidate
     return None
 
