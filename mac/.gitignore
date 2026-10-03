@@ -1,6 +1,27 @@
+# Python
 __pycache__/
 *.py[cod]
-direct.json
-.sync_rules.lock
-backup/
+*.so
+.Python
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 备份文件
+*.backup
+*_old.py
+test_*.py
+
+# 运行时数据（不提交到版本控制）
+*.log
+*.json.tmp
+
+# macOS
+.DS_Store
+
+# vfox
 .vfox/

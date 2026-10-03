@@ -1,0 +1,211 @@
+{
+  "items": [
+    {
+      "groupid": "custom",
+      "urlOrPath": "",
+      "remark": "自定义",
+      "editAble": true,
+      "groups": [
+        {
+          "groupid": "custom",
+          "name": "🍎 苹果服务",
+          "type": "",
+          "or": true,
+          "rule_set_build_in": [
+            "geosite:apple",
+            "geosite:apple@ads",
+            "geosite:apple-dev",
+            "geosite:apple-pki",
+            "geosite:apple-update"
+          ],
+          "domain_suffix": [
+            "apple.com",
+            "apple.com.cn",
+            "itunes.com",
+            "itunes.apple.com",
+            "mzstatic.com",
+            "icloud.com",
+            "icloud.com.cn",
+            "apple-cloudkit.com",
+            "cdn-apple.com",
+            "aaplimg.com",
+            "swcdn.apple.com",
+            "swdownload.apple.com"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "🏠 强制直连",
+          "type": "",
+          "or": true,
+          "domain_suffix": [
+            "qxai666.com",
+            "qzsyzn.com",
+            "ggss.club",
+            "keda123.com",
+            "zmetaboard.com",
+            "adm.webportal.top",
+            "ai730.com",
+            "andtxdd.com",
+            "bcserp.com",
+            "cloota.com",
+            "eshutong.com",
+            "feizhuke.com",
+            "haoyong333.com",
+            "hdm.webportal.top",
+            "i.mall.vip.webportal.top",
+            "i.vip.webportal.top",
+            "iqinghu.com",
+            "j9p.com",
+            "jiadaoyun.com",
+            "menglar.com",
+            "q2662564430.webportal.top",
+            "ventacorius.com",
+            "xiangjifanyi.com",
+            "yingheapk.com",
+            "zmetasoft.com"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "💬 OpenAI",
+          "type": "",
+          "or": true,
+          "domain_suffix": [
+            "openai.com",
+            "chatgpt.com",
+            "oaistatic.com",
+            "oaiusercontent.com",
+            "openaiapi-site.azureedge.net"
+          ],
+          "rule_set_build_in": [
+            "geoip:openai",
+            "geosite:openai"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "♊️ Google Gemini",
+          "type": "",
+          "or": true,
+          "domain_suffix": [
+            "aistudio.google.com",
+            "makersuite.google.com",
+            "generativelanguage.googleapis.com",
+            "gemini.google.com",
+            "ai.google.dev",
+            "alkalimakersuite-pa.clients6.google.com"
+          ],
+          "rule_set_build_in": [
+            "acl:Gemini",
+            "geosite:google-gemini"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "💬 Claude",
+          "type": "",
+          "or": true,
+          "domain_suffix": [
+            "anthropic.com",
+            "claude.ai"
+          ],
+          "rule_set_build_in": [
+            "acl:Claude",
+            "acl:ClaudeAI",
+            "geosite:anthropic"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "🌏 Google",
+          "type": "",
+          "or": true,
+          "rule_set_build_in": [
+            "geosite:google",
+            "geoip:google"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "🐱 GitHub",
+          "type": "",
+          "or": true,
+          "rule_set_build_in": [
+            "geoip:github",
+            "geosite:github"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "📹 油管视频",
+          "type": "",
+          "or": true,
+          "rule_set_build_in": [
+            "geosite:youtube"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "🌏 Google Play",
+          "type": "",
+          "or": true,
+          "rule_set_build_in": [
+            "geosite:google-play"
+          ],
+          "package": [
+            "com.android.vending"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "🌏 国外穿墙",
+          "type": "",
+          "or": true,
+          "rule_set_build_in": [
+            "geosite:geolocation-!cn",
+            "acl:ProxyGFWlist",
+            "acl:ProxyMedia"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "📺 哔哩哔哩",
+          "type": "",
+          "or": true,
+          "rule_set_build_in": [
+            "acl:BilibiliHMT",
+            "acl:Bilibili"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "🎯 国内直连",
+          "type": "",
+          "or": true,
+          "rule_set_build_in": [
+            "geosite:cn",
+            "geoip:cn",
+            "acl:ChinaIp",
+            "acl:ChinaDomain",
+            "acl:ChinaCompanyIp",
+            "acl:UnBan",
+            "acl:SteamCN",
+            "acl:Download",
+            "acl:ChinaMedia"
+          ]
+        },
+        {
+          "groupid": "custom",
+          "name": "囡囡喵面板",
+          "type": "",
+          "or": true,
+          "domain_suffix": [
+            "xn--i2r10aa.com"
+          ]
+        }
+      ]
+    }
+  ],
+  "rule_set_items": []
+}

@@ -1,0 +1,120 @@
+{
+  "disable": [],
+  "select_default": "德国备 ❀电信❀小豆豆❀1倍",
+  "recent": [
+    {
+      "groupid": "urltest",
+      "attach": "",
+      "latency": "",
+      "outlet_ip": "",
+      "outlet_region": "",
+      "type": "urltest",
+      "tag": "urltest_out"
+    }
+  ],
+  "fav": [],
+  "geosite": [
+    "cn",
+    "geolocation-!cn"
+  ],
+  "geoip": [
+    "cn"
+  ],
+  "acl": [],
+  "ruleset_direct_download": [],
+  "diversion_group": [
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "🍎 苹果服务",
+      "server_groupid": "direct",
+      "server_name": "direct_out",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "🏠 强制直连",
+      "server_groupid": "direct",
+      "server_name": "direct_out",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "💬 OpenAI",
+      "server_groupid": "urltest",
+      "server_name": "GPT自动",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "♊️ Google Gemini",
+      "server_groupid": "urltest",
+      "server_name": "GPT自动",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "💬 Claude",
+      "server_groupid": "urltest",
+      "server_name": "GPT自动",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "🌏 Google",
+      "server_groupid": "urltest",
+      "server_name": "urltest_out",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "🐱 GitHub",
+      "server_groupid": "urltest",
+      "server_name": "urltest_out",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "📹 油管视频",
+      "server_groupid": "urltest",
+      "server_name": "urltest_out",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "🌏 Google Play",
+      "server_groupid": "urltest",
+      "server_name": "urltest_out",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "🌏 国外穿墙",
+      "server_groupid": "urltest",
+      "server_name": "urltest_out",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "📺 哔哩哔哩",
+      "server_groupid": "direct",
+      "server_name": "direct_out",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "custom",
+      "diversion_name": "🎯 国内直连",
+      "server_groupid": "direct",
+      "server_name": "direct_out",
+      "dns_servers": []
+    },
+    {
+      "diversion_groupid": "final",
+      "diversion_name": "",
+      "server_groupid": "urltest",
+      "server_name": "urltest_out",
+      "dns_servers": []
+    }
+  ],
+  "server_select_search_select": [],
+  "add_profile_select": []
+}
