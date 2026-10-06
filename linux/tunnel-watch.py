@@ -196,14 +196,28 @@ def notify(title: str, body: str, urgent: bool = False):
 
 
 def get_proxy_port() -> int:
-    """获取代理端口"""
+    """获取代理端口（从 service_core.json 读取）"""
     try:
-        config = api_request('/configs')
-        port = config.get('port')
-        if isinstance(port, int) and 1 <= port <= 65535:
-            return port
+        core_json = Path.home() / '.local/share/com.nebula.karing/service_core.json'
+        if core_json.exists():
+            cfg = json.loads(core_json.read_text())
+
+            # 查找 mixed_in_rule 端口（规则代理）
+            for inbound in cfg.get('inbounds', []):
+                if inbound.get('tag') == 'mixed_in_rule' and inbound.get('type') == 'mixed':
+                    port = inbound.get('listen_port')
+                    if isinstance(port, int) and 1 <= port <= 65535:
+                        return port
+
+            # 备选：mixed_in_proxy
+            for inbound in cfg.get('inbounds', []):
+                if inbound.get('tag') == 'mixed_in_proxy' and inbound.get('type') == 'mixed':
+                    port = inbound.get('listen_port')
+                    if isinstance(port, int) and 1 <= port <= 65535:
+                        return port
     except Exception:
         pass
+
     return 7890  # 默认端口
 
 
